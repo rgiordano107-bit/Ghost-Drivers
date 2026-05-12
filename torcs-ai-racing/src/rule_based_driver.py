@@ -436,42 +436,201 @@ def destringify(s):
         else:
             return [destringify(i) for i in s]
 
-def drive_example(c):
-    '''This is only an example. It will get around the track but the
-    correct thing to do is write your own `drive()` function.'''
-    S,R= c.S.d,c.R.d
-    target_speed=160
-
-    R['steer']= S['angle']*25 / PI
-    R['steer']-= S['trackPos']*.25
-
-    R['accel'] = max(0.0, min(1.0, R['accel']))
-    
-
-    if S['speedX'] < target_speed - (R['steer']*2.5):
-        R['accel']+= .4
+def automatic_gear(speed):
+    """
+    Cambio automatico semplice.
+    Così il bot non deve pensare anche alle marce.
+    """
+    if speed < 40:
+        return 1
+    elif speed < 75:
+        return 2
+    elif speed < 110:
+        return 3
+    elif speed < 145:
+        return 4
+    elif speed < 180:
+        return 5
     else:
-        R['accel']-= .2
-    if S['speedX']<10:
-       R['accel']+= 1/(S['speedX']+.1)
-
-    if ((S['wheelSpinVel'][2]+S['wheelSpinVel'][3]) -
-       (S['wheelSpinVel'][0]+S['wheelSpinVel'][1]) > 2):
-       R['accel']-= 0.1
+        return 6
 
 
+def get_track_sensors(S):
+    """
+    Recupera i 19 sensori track.
+    Se per qualche motivo non arrivano correttamente, evita crash.
+    """
+    track = S.get("track", [200.0] * 19)
 
-    R['gear']=1
-    if S['speedX']>60:
-        R['gear']=2
-    if S['speedX']>100:
-        R['gear']=3
-    if S['speedX']>140:
-        R['gear']=4
-    if S['speedX']>190:
-        R['gear']=5
-    if S['speedX']>220:
-        R['gear']=6
+    if not isinstance(track, list) or len(track) < 19:
+        track = [200.0] * 19
+
+    return track
+
+
+def drive_example(c):
+    """
+    Driver rule-based prudente.
+
+    Obiettivo:
+    - anticipare la curva usando track[19]
+    - frenare prima della curva
+    - sterzare verso la parte della pista che si apre
+    - non cercare ancora il tempo veloce
+    """
+
+    S, R = c.S.d, c.R.d
+
+    # ==========================
+    # SENSORI BASE
+    # ==========================
+    speed = float(S.get("speedX", 0.0))
+    angle = float(S.get("angle", 0.0))
+    track_pos = float(S.get("trackPos", 0.0))
+
+    track = get_track_sensors(S)
+
+    # Sensori frontali.
+    # track[9] guarda davanti.
+    # track[8] e track[10] sono appena a sinistra/destra del centro.
+    front = (track[8] + track[9] + track[10]) / 3.0
+
+    # Gruppi di sensori per capire dove si apre la pista.
+    left_front = (track[3] + track[4] + track[5] + track[6] + track[7] + track[8]) / 6.0
+    right_front = (track[10] + track[11] + track[12] + track[13] + track[14] + track[15]) / 6.0
+
+    # Valore positivo: più spazio a sinistra.
+    # Valore negativo: più spazio a destra.
+    curve_signal = (left_front - right_front) / max(1.0, left_front + right_front)
+
+    # Intensità della curva: più i sensori frontali vedono poco spazio,
+    # più dobbiamo andare piano.
+    curve_intensity = 1.0 - min(front, 200.0) / 200.0
+
+    # ==========================
+    # TARGET SPEED ANTICIPATA
+    # ==========================
+    # Più front è basso, più la curva/muro è vicino.
+    if front < 25:
+        target_speed = 35
+    elif front < 45:
+        target_speed = 50
+    elif front < 70:
+        target_speed = 65
+    elif front < 100:
+        target_speed = 80
+    elif front < 140:
+        target_speed = 95
+    else:
+        target_speed = 115
+
+    # Se la curva sembra forte, abbassiamo ancora.
+    target_speed -= abs(curve_signal) * 45
+
+    # Se siamo storti o molto fuori centro, rallentiamo.
+    target_speed -= abs(angle) * 35
+    target_speed -= abs(track_pos) * 25
+
+    target_speed = clip(target_speed, 30, 120)
+
+    # ==========================
+    # STERZO
+    # ==========================
+    steer = 0.0
+
+    # 1. Correzione dell'angolo rispetto alla pista.
+    steer += angle * 1.7
+
+    # 2. Rientro verso il centro pista.
+    # Questa logica è coerente con il vecchio esempio snakeoil:
+    # steer -= trackPos * guadagno
+    steer -= track_pos * 0.70
+
+    # 3. Anticipo curva.
+    # Se la pista si apre a sinistra, sterziamo a sinistra.
+    # Se la pista si apre a destra, sterziamo a destra.
+    steer += curve_signal * 1.25
+
+    # 4. Se la curva è vicina, rendiamo l'anticipo più forte.
+    steer += curve_signal * curve_intensity * 1.00
+
+    # Se siamo quasi fuori pista, priorità assoluta al rientro.
+    if abs(track_pos) > 0.70:
+        steer -= track_pos * 0.80
+
+    # A velocità alta limitiamo lo sterzo per evitare ribaltamenti/oscillazioni.
+    if speed > 100:
+        steer = clip(steer, -0.55, 0.55)
+    elif speed > 70:
+        steer = clip(steer, -0.75, 0.75)
+    else:
+        steer = clip(steer, -1.0, 1.0)
+
+    # ==========================
+    # ACCELERATORE / FRENO
+    # ==========================
+    accel = 0.0
+    brake = 0.0
+
+    if speed < target_speed - 12:
+        accel = 0.75
+        brake = 0.0
+    elif speed < target_speed:
+        accel = 0.35
+        brake = 0.0
+    else:
+        accel = 0.0
+        brake = 0.18
+
+    # Frenata forte se la curva è molto vicina.
+    if front < 45 and speed > 50:
+        accel = 0.0
+        brake = max(brake, 0.45)
+
+    if front < 25 and speed > 35:
+        accel = 0.0
+        brake = max(brake, 0.65)
+
+    # Se la macchina è molto storta, togliamo gas.
+    if abs(angle) > 0.45:
+        accel *= 0.35
+        brake = max(brake, 0.25)
+
+    # Se siamo fuori pista, non frenare a caso: meglio provare a rientrare piano.
+    if abs(track_pos) > 1.0:
+        accel = 0.20
+        brake = 0.0
+
+    # ==========================
+    # TRACTION CONTROL
+    # ==========================
+    wheel = S.get("wheelSpinVel", [0.0, 0.0, 0.0, 0.0])
+
+    if isinstance(wheel, list) and len(wheel) >= 4:
+        rear_spin = wheel[2] + wheel[3]
+        front_spin = wheel[0] + wheel[1]
+        slip = rear_spin - front_spin
+
+        if slip > 5:
+            accel *= 0.5
+
+    # ==========================
+    # INVIO COMANDI
+    # ==========================
+    R["steer"] = clip(steer, -1.0, 1.0)
+    R["accel"] = clip(accel, 0.0, 1.0)
+    R["brake"] = clip(brake, 0.0, 1.0)
+    R["gear"] = automatic_gear(speed)
+    R["clutch"] = 0.0
+    R["meta"] = 0
+
+    print(
+        f"speed={speed:.1f} target={target_speed:.1f} "
+        f"front={front:.1f} left={left_front:.1f} right={right_front:.1f} "
+        f"curve={curve_signal:.2f} pos={track_pos:.2f} angle={angle:.2f} "
+        f"steer={R['steer']:.2f} accel={R['accel']:.2f} brake={R['brake']:.2f}"
+    )
+
     return
 
 if __name__ == "__main__":
